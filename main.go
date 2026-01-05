@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"strings"
 
@@ -15,200 +14,154 @@ import (
 	"google.golang.org/api/option"
 )
 
-// Lấy token từ web
-func getTokenFromWeb(config *oauth2.Config) *oauth2.Token {
+// Đọc file credentials.json
+func readCredentials() *oauth2.Config {
+	data, err := os.ReadFile("credentials.json")
+	if err != nil {
+		log.Fatal("❌ Không tìm thấy file credentials.json")
+	}
+
+	config, err := google.ConfigFromJSON(data, drive.DriveReadonlyScope)
+	if err != nil {
+		log.Fatal("❌ File credentials.json không hợp lệ")
+	}
+
+	return config
+}
+
+// Lấy token (xác thực lần đầu)
+func getToken(config *oauth2.Config) *oauth2.Token {
+	// Thử đọc token đã lưu
+	tokenFile := "token.json"
+	data, err := os.ReadFile(tokenFile)
+	if err == nil {
+		var token oauth2.Token
+		json.Unmarshal(data, &token)
+		return &token
+	}
+
+	// Chưa có token -> yêu cầu xác thực
 	config.RedirectURL = "urn:ietf:wg:oauth:2.0:oob"
-	
-	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-	fmt.Println("\n=== HƯỚNG DẪN XÁC THỰC ===")
-	fmt.Println("1. Mở URL sau trong trình duyệt:")
-	fmt.Printf("\n%v\n\n", authURL)
-	fmt.Println("2. Đăng nhập và cho phép quyền truy cập")
-	fmt.Println("3. Copy mã xác thực hiển thị trên trang")
-	fmt.Print("4. Dán mã vào đây: ")
+	url := config.AuthCodeURL("state", oauth2.AccessTypeOffline)
 
-	var authCode string
-	if _, err := fmt.Scan(&authCode); err != nil {
-		log.Fatalf("Không thể đọc mã xác thực: %v", err)
-	}
+	fmt.Println("\n=== XÁC THỰC LẦN ĐẦU ===")
+	fmt.Println("1. Mở link này trong trình duyệt:")
+	fmt.Println(url)
+	fmt.Println("\n2. Đăng nhập và cho phép quyền truy cập")
+	fmt.Print("3. Nhập mã xác thực: ")
 
-	tok, err := config.Exchange(context.TODO(), authCode)
+	var code string
+	fmt.Scan(&code)
+
+	token, err := config.Exchange(context.Background(), code)
 	if err != nil {
-		log.Fatalf("Không thể lấy token: %v", err)
+		log.Fatal("❌ Mã xác thực không đúng")
 	}
-	return tok
+
+	// Lưu token
+	data, _ = json.Marshal(token)
+	os.WriteFile(tokenFile, data, 0600)
+	fmt.Println("✅ Xác thực thành công!\n")
+
+	return token
 }
 
-// Lưu token vào file
-func saveToken(path string, token *oauth2.Token) {
-	fmt.Printf("Đang lưu token vào: %s\n", path)
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		log.Fatalf("Không thể lưu token: %v", err)
-	}
-	defer f.Close()
-	json.NewEncoder(f).Encode(token)
-}
-
-// Đọc token từ file
-func tokenFromFile(file string) (*oauth2.Token, error) {
-	f, err := os.Open(file)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	tok := &oauth2.Token{}
-	err = json.NewDecoder(f).Decode(tok)
-	return tok, err
-}
-
-// Lấy client OAuth2
-func getClient(config *oauth2.Config) *http.Client {
-	tokFile := "token.json"
-	tok, err := tokenFromFile(tokFile)
-	if err != nil {
-		tok = getTokenFromWeb(config)
-		saveToken(tokFile, tok)
-	}
-	return config.Client(context.Background(), tok)
-}
-
-// Tính dung lượng thư mục
-func calculateFolderSize(srv *drive.Service, folderID string) (int64, error) {
-	var totalSize int64
-	pageToken := ""
-	
-	for {
-		query := fmt.Sprintf("'%s' in parents and trashed=false", folderID)
-		
-		call := srv.Files.List().
-			Q(query).
-			Fields("nextPageToken, files(id, mimeType, size)").
-			PageSize(1000)
-		
-		if pageToken != "" {
-			call = call.PageToken(pageToken)
-		}
-		
-		r, err := call.Do()
-		if err != nil {
-			return 0, err
-		}
-		
-		for _, file := range r.Files {
-			if file.MimeType == "application/vnd.google-apps.folder" {
-				// Đệ quy tính dung lượng thư mục con
-				subSize, err := calculateFolderSize(srv, file.Id)
-				if err == nil {
-					totalSize += subSize
-				}
-			} else {
-				totalSize += file.Size
-			}
-		}
-		
-		pageToken = r.NextPageToken
-		if pageToken == "" {
-			break
-		}
-	}
-	
-	return totalSize, nil
-}
-
-// Chuyển đổi bytes sang đơn vị dễ đọc
+// Tính dung lượng thư mục (KB, MB, GB)
 func formatSize(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
+	if bytes < 1024 {
 		return fmt.Sprintf("%d B", bytes)
 	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
+	kb := float64(bytes) / 1024
+	if kb < 1024 {
+		return fmt.Sprintf("%.2f KB", kb)
 	}
-	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+	mb := kb / 1024
+	if mb < 1024 {
+		return fmt.Sprintf("%.2f MB", mb)
+	}
+	gb := mb / 1024
+	return fmt.Sprintf("%.2f GB", gb)
 }
 
-// Liệt kê thư mục
-func listFolders(srv *drive.Service, parentID string, level int) error {
-	query := "mimeType='application/vnd.google-apps.folder'"
-	if parentID != "" {
-		query += fmt.Sprintf(" and '%s' in parents", parentID)
-	} else {
-		query += " and 'root' in parents"
-	}
-	query += " and trashed=false"
+// Tính tổng dung lượng của 1 thư mục
+func getFolderSize(srv *drive.Service, folderID string) int64 {
+	var total int64
 
-	r, err := srv.Files.List().
-		Q(query).
-		Fields("files(id, name, createdTime, modifiedTime)").
-		OrderBy("name").
-		Do()
-	
+	// Lấy tất cả file trong thư mục
+	query := fmt.Sprintf("'%s' in parents and trashed=false", folderID)
+	files, err := srv.Files.List().Q(query).Fields("files(id, mimeType, size)").PageSize(1000).Do()
 	if err != nil {
-		return fmt.Errorf("không thể lấy danh sách thư mục: %v", err)
+		return 0
 	}
 
-	indent := ""
-	for i := 0; i < level; i++ {
-		indent += "  "
-	}
-
-	for _, folder := range r.Files {
-		// Tính dung lượng thư mục
-		size, err := calculateFolderSize(srv, folder.Id)
-		sizeStr := "0 B"
-		if err == nil {
-			sizeStr = formatSize(size)
+	for _, f := range files.Files {
+		if f.MimeType == "application/vnd.google-apps.folder" {
+			// Nếu là thư mục con -> tính đệ quy
+			total += getFolderSize(srv, f.Id)
+		} else {
+			// Nếu là file -> cộng dung lượng
+			total += f.Size
 		}
-		
-		// Format ngày tạo
-		createdTime := "N/A"
-		if folder.CreatedTime != "" {
-			createdTime = folder.CreatedTime[:10] // Lấy YYYY-MM-DD
-		}
-		
-		fmt.Printf("%s📁 %-40s | %10s | %s\n", 
-			indent, 
-			folder.Name, 
-			sizeStr, 
-			createdTime)
-		
-		// Đệ quy liệt kê thư mục con
-		listFolders(srv, folder.Id, level+1)
 	}
 
-	return nil
+	return total
+}
+
+// In danh sách thư mục
+func printFolders(srv *drive.Service, parentID string, indent int) {
+	// Tìm thư mục
+	query := "mimeType='application/vnd.google-apps.folder' and trashed=false"
+	if parentID == "" {
+		query += " and 'root' in parents"
+	} else {
+		query += fmt.Sprintf(" and '%s' in parents", parentID)
+	}
+
+	folders, err := srv.Files.List().Q(query).Fields("files(id, name, createdTime)").OrderBy("name").Do()
+	if err != nil {
+		return
+	}
+
+	// In từng thư mục
+	for _, folder := range folders.Files {
+		// Tạo khoảng trắng đầu dòng
+		spaces := strings.Repeat("  ", indent)
+
+		// Tính dung lượng
+		size := getFolderSize(srv, folder.Id)
+		sizeStr := formatSize(size)
+
+		// Lấy ngày tạo (chỉ lấy YYYY-MM-DD)
+		date := "N/A"
+		if len(folder.CreatedTime) >= 10 {
+			date = folder.CreatedTime[:10]
+		}
+
+		// In thông tin
+		fmt.Printf("%s📁 %-40s | %10s | %s\n", spaces, folder.Name, sizeStr, date)
+
+		// In thư mục con (đệ quy)
+		printFolders(srv, folder.Id, indent+1)
+	}
 }
 
 func main() {
-	ctx := context.Background()
+	// Bước 1: Đọc credentials
+	config := readCredentials()
 
-	// Đọc credentials từ file
-	b, err := os.ReadFile("credentials.json")
+	// Bước 2: Lấy token (xác thực)
+	token := getToken(config)
+	client := config.Client(context.Background(), token)
+
+	// Bước 3: Kết nối Drive API
+	srv, err := drive.NewService(context.Background(), option.WithHTTPClient(client))
 	if err != nil {
-		log.Fatalf("Không thể đọc file credentials.json: %v\n", err)
-		log.Fatal("Vui lòng tải credentials.json từ Google Cloud Console")
+		log.Fatal("❌ Không thể kết nối Drive API")
 	}
 
-	config, err := google.ConfigFromJSON(b, drive.DriveReadonlyScope)
-	if err != nil {
-		log.Fatalf("Không thể parse credentials: %v", err)
-	}
-
-	client := getClient(config)
-
-	srv, err := drive.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		log.Fatalf("Không thể tạo Drive service: %v", err)
-	}
-
+	// Bước 4: In danh sách thư mục
 	fmt.Println("=== DANH SÁCH THƯ MỤC GOOGLE DRIVE ===")
-	fmt.Println("Format: Tên thư mục | Dung lượng | Ngày tạo\n")
+	fmt.Println("Format: Tên | Dung lượng | Ngày tạo")
 	fmt.Println(strings.Repeat("-", 80))
-	
-	if err := listFolders(srv, "", 0); err != nil {
-		log.Fatalf("Lỗi: %v", err)
-	}
+	printFolders(srv, "", 0)
 }
